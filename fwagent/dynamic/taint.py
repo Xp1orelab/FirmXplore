@@ -1269,9 +1269,15 @@ class TaintAnalysisBuilder:
             )
         return generated
 
+    @staticmethod
+    def _path_basename(path_str: str) -> str:
+        """跨平台取文件名：Windows 反斜杠路径在 POSIX Path 下不会被切分。"""
+        normalized = str(path_str).replace("\\", "/")
+        return Path(normalized).name
+
     def _sink_binary_name(self, sink: SensitiveSink) -> str | None:
         if sink.binary_path:
-            return Path(sink.binary_path).name
+            return self._path_basename(sink.binary_path)
         return None
 
     def _network_entry_callers(self, adjacency: dict[str, set[str]]) -> set[str]:
@@ -1335,7 +1341,7 @@ class TaintAnalysisBuilder:
                 if caller and callee:
                     adjacency.setdefault(caller, set()).add(callee)
             if adjacency:
-                result[Path(binary).name] = adjacency
+                result[self._path_basename(binary)] = adjacency
         return result
 
     @staticmethod

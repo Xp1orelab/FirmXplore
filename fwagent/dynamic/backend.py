@@ -153,7 +153,15 @@ class DockerQemuBackend(EmulationBackend):
 
         self.runner = runner or CommandRunner(self.workspace.logs_dir)
         self.image_builder = image_builder or UserspaceImageBuilder(self.runner)
-        self.network = network or UserModeNetworkBackend()
+        # QEMU 机器类型由固件架构决定：mips/mipsel -> malta，arm -> virt
+        arch = ""
+        try:
+            platform = (self.workspace.load_report().get("platform") or {})
+            arch = str(platform.get("architecture") or "").lower()
+        except Exception:  # noqa: BLE001  报告缺失时回退默认 virt
+            arch = ""
+        machine = "malta" if arch.startswith("mips") else "virt"
+        self.network = network or UserModeNetworkBackend(machine=machine)
         self.logs_path = self.workspace.logs_dir / "console.log"
 
     def prepare(self, firmware_path: str | Path) -> dict[str, Any]:
@@ -161,6 +169,8 @@ class DockerQemuBackend(EmulationBackend):
         rootfs = report.get("extraction", {}).get("rootfs")
         if not rootfs or not Path(rootfs).is_dir():
             return {"success": False, "errors": [f"rootfs not available: {rootfs}"]}
+        rootfs_path = Path(rootfs)
+        patch = self._patch_rootfs_for_boot(rootfs_path)
         output = self.workspace.dynamic_dir / "images" / "rootfs.ext4"
         result = self.image_builder.build(rootfs, output, size_mb=256)
         metadata = {
@@ -209,7 +219,17 @@ class DockerQemuBackend(EmulationBackend):
         duration = round(time.monotonic() - start, 3)
         console = _read_text(self.logs_path)
         diagnosis, errors = _classify_boot(console, result.exit_code, result.timed_out)
-        success = not errors and not result.timed_out and "login:" in console.lower()
+        # 不同固件的就绪提示不同：OpenWrt 印 "login:"，D-Link/BusyBox 印
+        # "Please press Enter to activate this console"
+        booted_markers = ("login:", "press enter to activate")
+        console_ready = any(marker in console.lower() for marker in booted_markers)
+        # 服务级成功判据（P2）：guest 的 Web 服务经 hostfwd 端口可真实访问，
+        # 对无 login 提示的固件（D-Link 等）是可靠的运行时观测。
+        http_probe = self._probe_http("127.0.0.1", 18080)
+        success = (not errors and not result.timed_out and console_ready) or http_probe["reachable"]
+        if http_probe["reachable"]:
+            # HTTP 可达即运行时观测成立，清掉非致命的 boot_timeout 归类
+            errors = [e for e in errors if e != "QEMU guest did not complete boot before timeout"] or errors
         return {
             "success": success,
             "backend": self.name,
@@ -220,6 +240,108 @@ class DockerQemuBackend(EmulationBackend):
             "timed_out": result.timed_out,
             "errors": errors,
             "console_tail": console[-4000:],
+            "runtime_probe": http_probe,
+        }
+
+    @staticmethod
+    def _probe_http(host: str, port: int, *, attempts: int = 3, wait: float = 2.0) -> dict[str, Any]:
+        """通过 hostfwd 端口探测 guest 的 HTTP 服务（运行时可达性观测）。"""
+        import http.client as _hc
+
+        last_error = None
+        for _ in range(attempts):
+            try:
+                conn = _hc.HTTPConnection(host, port, timeout=8)
+                conn.request("GET", "/")
+                response = conn.getresponse()
+                body = response.read(512)
+                conn.close()
+                return {
+                    "reachable": True,
+                    "status": response.status,
+                    "server": response.getheader("Server") or "",
+                    "body_prefix": body.decode("utf-8", errors="replace")[:200],
+                }
+            except OSError as exc:
+                last_error = str(exc)
+                time.sleep(wait)
+        return {"reachable": False, "error": last_error}
+
+    def _patch_rootfs_for_boot(self, rootfs: Path) -> dict[str, Any]:
+        """firmadyne fixImage 精简版（QEMU 无硬件环境下的引导修补）：
+
+        1. 禁用依赖真实硬件/厂商 nvram 的 init 脚本（wlan/led/gpiod/interfaces，
+           在 QEMU 中会死循环或阻塞后续 init，console 中表现为 soft lockup）；
+        2. 写入强制网络脚本：guest 的 NIC（e1000）按 QEMU user 网络约定
+           配置为 10.0.2.15/24、网关 10.0.2.2，绕过厂商 UCI/nvram 配置链。
+        """
+        import re as _re
+
+        def _readable_file(path: Path) -> bool:
+            try:
+                return path.is_file()
+            except OSError:
+                return False
+
+        changes: list[str] = []
+        init_dir = rootfs / "etc" / "init.d"
+        hw_pattern = _re.compile(r"(wlan|wifi|wireless|led|gpiod|interface)", _re.I)
+        for script_dir in {init_dir, rootfs / "etc" / "init0.d", rootfs / "etc" / "scripts"}:
+            if not script_dir.is_dir():
+                continue
+            for script in sorted(script_dir.glob("S*")):
+                if not _readable_file(script) or not script.is_file():
+                    continue
+                if hw_pattern.search(script.stem):
+                    # 加前缀而不是后缀：busybox rcS 用 S??* 通配执行，仅改后缀仍会被执行
+                    script.rename(script.with_name("disabled-by-emulator-" + script.name))
+                    changes.append(f"disabled {script_dir.name}/{script.name}")
+        init_dir.mkdir(parents=True, exist_ok=True)
+        # Firmadyne 约定：uclibc 二进制（xmldbc/httpd/servd 等）通过
+        # LD_PRELOAD 顺序搜索 /firmadyne/libnvram.so——D-Link 固件硬编码
+        # 该路径，缺失时 NVRAM 读取失败、配置守护与 httpd 全部无法启动。
+        firmadyne_dir = rootfs / "firmadyne"
+        firmadyne_dir.mkdir(parents=True, exist_ok=True)
+        # FirmAE 的 mipsel libnvram（容器内）写入 guest 的 /firmadyne/ 与 /lib/。
+        # 不用 symlink：Windows bind mount（virtiofs）上创建符号链接会失败。
+        mipsel_lib = Path("/opt/FirmAE/binaries/libnvram.so.mipsel")
+        for dest in (firmadyne_dir / "libnvram.so", rootfs / "lib" / "libnvram.so"):
+            try:
+                if mipsel_lib.is_file():
+                    with open(mipsel_lib, "rb") as src, open(dest, "wb") as dst:
+                        dst.write(src.read())
+                    changes.append(f"installed {dest.relative_to(rootfs)} (FirmAE mipsel)")
+            except OSError as exc:
+                changes.append(f"libnvram placement failed for {dest}: {exc}")
+        net_script = init_dir / "S40firmxplore-net"
+        net_script.write_text(
+            "#!/bin/sh\n"
+            "# FirmXplore emulator: force NIC onto the QEMU user-mode network\n"
+            "ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up\n"
+            "route add default gw 10.0.2.2\n",
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(net_script, 0o755)
+        except OSError:
+            pass
+        changes.append("added S40firmxplore-net")
+        return {"success": True, "changes": changes}
+
+    def prepare(self, firmware_path: str | Path) -> dict[str, Any]:
+        report = self.workspace.load_report()
+        rootfs = report.get("extraction", {}).get("rootfs")
+        if not rootfs or not Path(rootfs).is_dir():
+            return {"success": False, "errors": [f"rootfs not available: {rootfs}"]}
+        rootfs_path = Path(rootfs)
+        patch = self._patch_rootfs_for_boot(rootfs_path)
+        output = self.workspace.dynamic_dir / "images" / "rootfs.ext4"
+        result = self.image_builder.build(rootfs, output, size_mb=256)
+        return {
+            "success": result.success,
+            "image": str(output),
+            "metadata": {**(result.metadata or {}), "boot_patch": patch},
+            "errors": result.errors,
         }
 
     def status(self) -> dict[str, Any]:
@@ -244,6 +366,8 @@ class DockerQemuBackend(EmulationBackend):
         if arch in {"arm", "armel"}:
             return [
                 "qemu-system-arm",
+                "-vga",
+                "none",
                 "-m",
                 "256",
                 "-M",
@@ -267,6 +391,8 @@ class DockerQemuBackend(EmulationBackend):
         if arch in {"mips", "mipsel"}:
             return [
                 "qemu-system-mipsel",
+                "-vga",
+                "none",
                 "-m",
                 "256",
                 "-M",
@@ -276,7 +402,7 @@ class DockerQemuBackend(EmulationBackend):
                 "-drive",
                 f"if=ide,format=raw,file={image}",
                 "-append",
-                "root=/dev/sda1 console=ttyS0 rw debug ignore_loglevel print-fatal-signals=1",
+                "root=/dev/sda console=ttyS0 rw debug ignore_loglevel print-fatal-signals=1",
                 "-serial",
                 f"file:{self.logs_path}",
                 "-display",
@@ -286,6 +412,8 @@ class DockerQemuBackend(EmulationBackend):
         if arch in {"mipsbe", "mipseb"}:
             return [
                 "qemu-system-mips",
+                "-vga",
+                "none",
                 "-m",
                 "256",
                 "-M",
@@ -295,7 +423,7 @@ class DockerQemuBackend(EmulationBackend):
                 "-drive",
                 f"if=ide,format=raw,file={image}",
                 "-append",
-                "root=/dev/sda1 console=ttyS0 rw debug ignore_loglevel print-fatal-signals=1",
+                "root=/dev/sda console=ttyS0 rw debug ignore_loglevel print-fatal-signals=1",
                 "-serial",
                 f"file:{self.logs_path}",
                 "-display",

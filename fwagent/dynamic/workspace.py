@@ -52,9 +52,13 @@ class DynamicWorkspace:
         candidate = report.get("firmware", {}).get("path") or report.get("firmware", {}).get("filename")
         if not candidate:
             return None
-        path = Path(candidate)
+        # 跨平台：Windows 反斜杠路径在 POSIX Path 下 .name 不切分，
+        # 统一规范化后再取文件名（否则容器内回退路径拼接错误）
+        normalized = str(candidate).replace("\\", "/")
+        name = normalized.rsplit("/", 1)[-1]
+        path = Path(normalized)
         if not path.exists():
-            alt = self.task_dir / "input" / path.name
+            alt = self.task_dir / "input" / name
             if alt.exists():
                 return alt
             return None

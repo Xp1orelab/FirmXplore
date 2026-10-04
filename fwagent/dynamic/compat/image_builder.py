@@ -95,10 +95,10 @@ class UserspaceImageBuilder(FirmwareImageBuilder):
         command = [
             "mke2fs",
             "-t",
-            "ext4",
+            # FirmAE 的 2.6 内核没有 ext4 驱动（内核日志 do_mount type:ext3），
+            # ext2（无 extents/journal）在 2.6 与 4.1 内核上均可挂载
+            "ext2",
             "-F",
-            "-O",
-            "^metadata_csum,^64bit",
             "-d",
             str(root),
             str(output),
@@ -109,7 +109,7 @@ class UserspaceImageBuilder(FirmwareImageBuilder):
         return ImageBuildResult(
             success=success,
             output_path=output,
-            filesystem_type="ext4",
+            filesystem_type="ext2",
             image_size_mb=size_mb,
             builder=self.name,
             duration=round(time.monotonic() - start, 3),

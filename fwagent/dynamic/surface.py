@@ -848,9 +848,10 @@ class AttackSurfaceBuilder:
                 continue
             try:
                 for cgi in web_root.rglob("cgibin"):
-                    if not _is_readable_file(cgi) or not cgi.is_file():
-                        continue
                     rel = cgi.relative_to(rootfs).as_posix()
+                    # 注意：不做 is_file() 预检——提取器产出的部分特殊 inode 在
+                    # Windows 上 stat 直接抛 WinError 1920，按路径注册入口，
+                    # 组件解析与内容嗅探全部尽力而为。
                     component_id, handler_id = self._resolve_route_component(cgi, rel, component_names)
                     entries.append(
                         EntryPoint(
@@ -873,8 +874,6 @@ class AttackSurfaceBuilder:
                     )
                 for pattern in ("*.cgi", "*.fcgi"):
                     for script in web_root.rglob(pattern):
-                        if not _is_readable_file(script) or not script.is_file():
-                            continue
                         rel = script.relative_to(rootfs).as_posix()
                         component_id, handler_id = self._resolve_route_component(script, rel, component_names)
                         entries.append(

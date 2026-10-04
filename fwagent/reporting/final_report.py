@@ -225,7 +225,7 @@ class ReportGenerator:
             model_investigation=self._model_investigation_summary(model_investigation),
             model_hypotheses=self._model_hypotheses(model_investigation),
             model_evidence=self._model_evidence(model_investigation),
-            user_skipped_stages=(pipeline.get("user_skipped_stages") if isinstance(pipeline, dict) else []) or [],
+            user_skipped_stages=self._user_skipped_stages(),
             taint_quality=self._taint_quality(taint),
         )
 
@@ -327,6 +327,26 @@ class ReportGenerator:
                 "argument-level data flow is NOT established unless argument_mapped_path_count > 0"
             ),
         }
+
+    def _user_skipped_stages(self) -> list[str]:
+        """P2-2：按 task.json 的 analysis_mode 列出用户主动跳过的阶段。
+
+        直接从 task.json 派生而不是读 pipeline_stages.json——
+        regenerate_report 不重写后者，读它会拿到过期数据。
+        """
+        mode = ""
+        try:
+            state = json.loads((self.task_dir / "task.json").read_text(encoding="utf-8"))
+            mode = str(state.get("analysis_mode") or "normal")
+        except (OSError, json.JSONDecodeError):
+            return []
+        if mode == "static-only":
+            return ["COMPONENT_CORRELATION", "ATTACK_SURFACE", "TAINT_CORRELATION", "HYPOTHESIS_SYNTHESIS", "PRIORITIZATION", "INVESTIGATION", "DYNAMIC_VALIDATION"]
+        if mode == "fast":
+            return ["STATIC_TARGET_SELECTION", "GHIDRA_ANALYSIS", "COMPONENT_CORRELATION", "ATTACK_SURFACE", "TAINT_CORRELATION", "HYPOTHESIS_SYNTHESIS", "PRIORITIZATION", "INVESTIGATION", "DYNAMIC_VALIDATION"]
+        if mode == "no-dynamic":
+            return ["INVESTIGATION", "DYNAMIC_VALIDATION"]
+        return []
 
     def generate_json(self, model: AnalysisReport) -> Path:
         path = self.reports_dir / "report.json"

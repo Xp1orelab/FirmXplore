@@ -4,6 +4,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# deb.debian.org 的 Fastly CDN 在受限网络下间歇 502，切换到阿里云镜像
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
+
+# 受限网络下个别包连接会失败，全局重试
+RUN echo 'Acquire::Retries "8";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";' > /etc/apt/apt.conf.d/99retry
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         binutils \
@@ -23,6 +30,7 @@ RUN apt-get update \
         qemu-system-arm \
         qemu-system-mips \
         qemu-user-static \
+        seabios \
         socat \
         tcpdump \
         unzip \
@@ -30,11 +38,26 @@ RUN apt-get update \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# FirmAE install is best-effort; the wrapper reports structured status if it is missing.
+# FirmAE: clone the framework, but inject pre-downloaded binaries via COPY.
+# Historical problem: download.sh fetched kernels from GitHub release-assets at
+# build time and silently failed behind restricted networks, leaving /opt/FirmAE
+# empty and every later boot failing with "No boot completion marker observed".
+# The binaries under docker/firmae-binaries/ are the contents of FirmAE's
+# download.sh (kernels from FirmAE_kernel-v2.6 / -v4.1 releases), committed
+# alongside this Dockerfile so the build is reproducible offline.
+# binwalk-2.3.4 是 FirmAE 的 git submodule（pip 安装与 py312 补丁都需要它）
+# 实测：该路径在 FirmAE 仓库中为空，install.sh 通过外网 wget 填充；
+# 受限网络下会静默失败，因此与内核一样改为 COPY 预下载源码。
 RUN git clone --recursive --depth 1 https://github.com/pr0v3rbs/FirmAE /opt/FirmAE \
-    && cd /opt/FirmAE \
-    && (./download.sh || true) \
-    && (./install.sh || true)
+    && rm -rf /opt/FirmAE/binaries /opt/FirmAE/binwalk-2.3.4
+COPY docker/firmae-binaries/ /opt/FirmAE/binaries/
+COPY docker/firmae-binaries-binwalk/ /opt/FirmAE/binwalk-2.3.4/
+# Strict verification: boot cannot proceed without the emulation kernels.
+RUN test -f /opt/FirmAE/binaries/vmlinux.mipsel.2 \
+    && test -f /opt/FirmAE/binaries/busybox.mipsel \
+    && test -f /opt/FirmAE/binaries/console.mipsel \
+    && test -f /opt/FirmAE/binaries/libnvram.so.mipsel \
+    && chmod +x /opt/FirmAE/binaries/*
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

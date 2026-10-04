@@ -162,8 +162,10 @@ class FirmXploreV01IntegrationTests(unittest.TestCase):
 
     def test_readme_uses_only_firmxplore_product_name(self) -> None:
         text = Path("README.md").read_text(encoding="utf-8")
-        self.assertIn("Deep Exploration and Evaluation Platform for Device Understanding, Correlation, and Knowledge", text)
-        self.assertIn("arXiv", text)
+        self.assertIn("# FirmXplore", text)
+        self.assertIn("FirmXplore is an automated evidence-driven firmware security analysis agent", text)
+        self.assertNotIn("DeepDuck", text)
+        self.assertNotIn("deepduck", text)
 
     def test_analysis_status_fast(self) -> None:
         stages = {name: PipelineStageResult(name, status="completed") for name in V01_PIPELINE_STAGES}

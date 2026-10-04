@@ -15,6 +15,14 @@ class ForwardedPort:
 class EmulationNetworkBackend:
     name = "base"
 
+    def __init__(self, machine: str = "virt") -> None:
+        # 网卡设备随 QEMU 机器类型变化：virt（ARM）有 virtio-mmio 总线，
+        # malta（MIPS）走 PCI 的 pcnet32（Firmadyne/FirmAE 内核内置驱动）。
+        self.machine = machine
+
+    def _nic_device(self) -> str:
+        return "virtio-net-device" if self.machine.startswith("virt") else "e1000"
+
     def prepare(self, guest_ports: list[int] | None = None) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -31,7 +39,8 @@ class EmulationNetworkBackend:
 class UserModeNetworkBackend(EmulationNetworkBackend):
     name = "qemu-user-network"
 
-    def __init__(self, forwarded_ports: tuple[int, ...] = (80,)):
+    def __init__(self, forwarded_ports: tuple[int, ...] = (80,), machine: str = "virt"):
+        super().__init__(machine=machine)
         self.forwarded_ports = tuple(forwarded_ports)
         self.ports: dict[int, ForwardedPort] = {}
 
@@ -62,7 +71,7 @@ class UserModeNetworkBackend(EmulationNetworkBackend):
         return self.ports.get(guest_port)
 
     def qemu_args(self) -> list[str]:
-        args = ["-device", "virtio-net-device,netdev=net0"]
+        args = ["-device", f"{self._nic_device()},netdev=net0"]
         hostfwd = []
         for guest_port, item in self.ports.items():
             hostfwd.append(f"hostfwd=tcp:{item.host}:{item.host_port}-:{guest_port}")
@@ -83,4 +92,4 @@ class TapNetworkBackend(EmulationNetworkBackend):
         return None
 
     def qemu_args(self) -> list[str]:
-        return ["-device", "virtio-net-device,netdev=net0", "-netdev", "tap,id=net0"]
+        return ["-device", f"{self._nic_device()},netdev=net0", "-netdev", "tap,id=net0"]
