@@ -226,10 +226,12 @@ class DockerQemuBackend(EmulationBackend):
         # 服务级成功判据（P2）：guest 的 Web 服务经 hostfwd 端口可真实访问，
         # 对无 login 提示的固件（D-Link 等）是可靠的运行时观测。
         http_probe = self._probe_http("127.0.0.1", 18080)
-        success = (not errors and not result.timed_out and console_ready) or http_probe["reachable"]
-        if http_probe["reachable"]:
-            # HTTP 可达即运行时观测成立，清掉非致命的 boot_timeout 归类
-            errors = [e for e in errors if e != "QEMU guest did not complete boot before timeout"] or errors
+        # console 到达就绪提示即视为 boot 成功——QEMU 由探针侧超时终止是预期行为，
+        # 不构成失败；致命分类（挂载失败/内核 panic/init 失败）仍然否决。
+        fatal = [e for e in errors if e not in ("QEMU guest did not complete boot before timeout",)]
+        success = (console_ready or http_probe["reachable"]) and not fatal
+        if success:
+            errors = fatal
         return {
             "success": success,
             "backend": self.name,
@@ -285,7 +287,9 @@ class DockerQemuBackend(EmulationBackend):
 
         changes: list[str] = []
         init_dir = rootfs / "etc" / "init.d"
-        hw_pattern = _re.compile(r"(wlan|wifi|wireless|led|gpiod|interface)", _re.I)
+        # 硬件依赖 + D-Link 事件/接口管理脚本：后者在虚拟环境里会因交换口
+        # DOWN 触发"停服务"事件循环（LAN-5.DOWN -> INFSVCS stop），干扰 HTTP 拉起
+        hw_pattern = _re.compile(r"(wlan|wifi|wireless|led|gpiod|interface|event|arpmon|pthrough|layout|inf)", _re.I)
         for script_dir in {init_dir, rootfs / "etc" / "init0.d", rootfs / "etc" / "scripts"}:
             if not script_dir.is_dir():
                 continue
@@ -297,6 +301,13 @@ class DockerQemuBackend(EmulationBackend):
                     script.rename(script.with_name("disabled-by-emulator-" + script.name))
                     changes.append(f"disabled {script_dir.name}/{script.name}")
         init_dir.mkdir(parents=True, exist_ok=True)
+        # 已知交换芯片配置脚本：操作真实 switch 寄存器（switch reg write），
+        # QEMU 无此硬件，内核 bp 探针上死循环——替换为 no-op
+        for hw_script in ("setvlan.sh", "setvlan_bridge.sh", "setdate.sh"):
+            hw = rootfs / "etc" / "scripts" / hw_script
+            if hw.is_file():
+                hw.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                changes.append(f"noop-ed etc/scripts/{hw_script}")
         # Firmadyne 约定：uclibc 二进制（xmldbc/httpd/servd 等）通过
         # LD_PRELOAD 顺序搜索 /firmadyne/libnvram.so——D-Link 固件硬编码
         # 该路径，缺失时 NVRAM 读取失败、配置守护与 httpd 全部无法启动。
@@ -318,7 +329,12 @@ class DockerQemuBackend(EmulationBackend):
             "#!/bin/sh\n"
             "# FirmXplore emulator: force NIC onto the QEMU user-mode network\n"
             "ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up\n"
-            "route add default gw 10.0.2.2\n",
+            "route add default gw 10.0.2.2\n"
+            # 厂商事件系统会把虚拟环境里 DOWN 的交换口服务停掉
+            # （LAN-5.DOWN -> INFSVCS.LAN-5 stop），显式拉起 Web 服务
+            # 保证运行时观测可用。
+            "sleep 5\n"
+            "service HTTP start\n",
             encoding="utf-8",
         )
         try:
