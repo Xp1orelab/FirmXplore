@@ -215,19 +215,55 @@ class DockerQemuBackend(EmulationBackend):
         start = time.monotonic()
         env = dict(os.environ)
         env["QEMU_AUDIO_DRV"] = "none"
-        result = self.runner.run(command, timeout=timeout + 30, env=env)
+        env["QEMU_AUDIO_DRV"] = "none"
+        # 运行中轮询：console 就绪或 HTTP hostfwd 可达即提前收尾（P2 服务级观测
+        # 必须在 QEMU 存活期间探测——进程退出后 hostfwd 端口随之消失）
+        booted_markers = ("login:", "press enter to activate")
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        deadline = start + timeout + 30
+        http_probe: dict[str, Any] = {"reachable": False, "error": "not probed"}
+        console_ready = False
+        try:
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break  # QEMU 自行退出，走失败分类
+                console = _read_text(self.logs_path)
+                console_ready = any(marker in console.lower() for marker in booted_markers)
+                http_probe = self._probe_http("127.0.0.1", 18080, attempts=1, wait=0.5)
+                if http_probe["reachable"]:
+                    time.sleep(5)  # 留出服务稳定窗口
+                    console = _read_text(self.logs_path)
+                    break
+                if console_ready:
+                    # console 就绪后再给 Web 服务 15s 启动窗口，期间继续探测
+                    for _ in range(3):
+                        time.sleep(5)
+                        http_probe = self._probe_http("127.0.0.1", 18080, attempts=1, wait=0.5)
+                        if http_probe["reachable"]:
+                            break
+                    break
+                time.sleep(10)
+            timed_out = time.monotonic() >= deadline
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         duration = round(time.monotonic() - start, 3)
         console = _read_text(self.logs_path)
-        diagnosis, errors = _classify_boot(console, result.exit_code, result.timed_out)
+        exit_code = proc.poll()
+        diagnosis, errors = _classify_boot(console, exit_code, timed_out and not (console_ready or http_probe["reachable"]))
         # 不同固件的就绪提示不同：OpenWrt 印 "login:"，D-Link/BusyBox 印
-        # "Please press Enter to activate this console"
-        booted_markers = ("login:", "press enter to activate")
-        console_ready = any(marker in console.lower() for marker in booted_markers)
-        # 服务级成功判据（P2）：guest 的 Web 服务经 hostfwd 端口可真实访问，
-        # 对无 login 提示的固件（D-Link 等）是可靠的运行时观测。
-        http_probe = self._probe_http("127.0.0.1", 18080)
-        # console 到达就绪提示即视为 boot 成功——QEMU 由探针侧超时终止是预期行为，
-        # 不构成失败；致命分类（挂载失败/内核 panic/init 失败）仍然否决。
+        # "Please press Enter to activate this console"。二者任一出现即为
+        # boot 成功——QEMU 由探针侧超时终止是预期行为，不构成失败；
+        # 致命分类（挂载失败/内核 panic/init 失败）仍然否决。
         fatal = [e for e in errors if e not in ("QEMU guest did not complete boot before timeout",)]
         success = (console_ready or http_probe["reachable"]) and not fatal
         if success:
@@ -238,8 +274,8 @@ class DockerQemuBackend(EmulationBackend):
             "architecture": architecture,
             "diagnosis": diagnosis,
             "duration": duration,
-            "exit_code": result.exit_code,
-            "timed_out": result.timed_out,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
             "errors": errors,
             "console_tail": console[-4000:],
             "runtime_probe": http_probe,
@@ -289,7 +325,9 @@ class DockerQemuBackend(EmulationBackend):
         init_dir = rootfs / "etc" / "init.d"
         # 硬件依赖 + D-Link 事件/接口管理脚本：后者在虚拟环境里会因交换口
         # DOWN 触发"停服务"事件循环（LAN-5.DOWN -> INFSVCS stop），干扰 HTTP 拉起
-        hw_pattern = _re.compile(r"(wlan|wifi|wireless|led|gpiod|interface|event|arpmon|pthrough|layout|inf)", _re.I)
+        # event 脚本只做"事件->服务"注册（httpd 启动会发 HTTP.UP，注册缺失会导致
+        # servd 找不到事件），保留注册；死循环源（autowan/arpmon/ptthrough）仍禁用
+        hw_pattern = _re.compile(r"(wlan|wifi|wireless|led|gpiod|interface|autowan|arpmon|ptthrough)", _re.I)
         for script_dir in {init_dir, rootfs / "etc" / "init0.d", rootfs / "etc" / "scripts"}:
             if not script_dir.is_dir():
                 continue
@@ -327,6 +365,14 @@ class DockerQemuBackend(EmulationBackend):
         net_script = init_dir / "S40firmxplore-net"
         net_script.write_text(
             "#!/bin/sh\n"
+            "# firmadyne 内核仅创建 /dev/ram 与 /dev/root；守护进程 daemon 化时\n"
+            "# 需要 /dev/null 等设备节点，缺失会导致 httpd: Cannot open 退出\n"
+            "[ -c /dev/null ] || mknod /dev/null c 1 3\n"
+            "[ -c /dev/zero ] || mknod /dev/zero c 1 5\n"
+            "[ -c /dev/console ] || mknod /dev/console c 5 1\n"
+            "[ -c /dev/urandom ] || mknod /dev/urandom c 1 9\n"
+            "[ -c /dev/random ] || mknod /dev/random c 1 8\n"
+            "chmod 666 /dev/null /dev/zero /dev/urandom /dev/random 2>/dev/null\n"
             "# FirmXplore emulator: force NIC onto the QEMU user-mode network\n"
             "ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up\n"
             "route add default gw 10.0.2.2\n"

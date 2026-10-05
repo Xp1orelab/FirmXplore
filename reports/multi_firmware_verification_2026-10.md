@@ -230,6 +230,7 @@ Ghidra callgraph 可达链（L2），未建立参数级数据流（L3）。报�
 | 厂商服务链 | servd 服务管理器响应 `service HTTP start`（svchlper 执行）；确定性调查 2 轮收敛 |
 | Findings | 14（与静态轮一致） |
 | 遗留缺口 | D-Link 私有配置守护（xmldb/servd 状态机）未完全满足 HTTP 服务的最终拉起条件，`httpd` 二进制尚未 exec——需扩展 D-Link XML 配置模拟（预置 `/etc/defnodes/*.xml` 汇总、模拟 flash 读取），属 per-firmware 深度工作 |
+| 运行时 HTTP 探测 | `_probe_http` 经 hostfwd 的服务级探测机制已实现并在 QEMU 存活期间轮询（早前的 Connection refused 系探针时机在 QEMU 终止之后，已改为运行中轮询）；guest 内 httpd 未启动故探测未命中 |
 
 ### 10.2 动态验证能力结论
 
@@ -237,3 +238,25 @@ Ghidra callgraph 可达链（L2），未建立参数级数据流（L3）。报�
 此前完全不可能的固件动态分析（boot 观测、init 序列审计、控制台交互、网络配置验证）
 现已可常规执行；对目标固件 Web 服务的网络级可达观测（HTTP 探测）机制已就位，
 剩余为按厂商逐个补齐配置模拟的常规迭代工作。
+
+
+## 11. 补充澄清（httpd 拉起路径与下一轮方向）
+
+1. **`/sbin/httpd` 二进制本身完好**（MIPS32 LE ELF，/lib/ld-uClibc.so.0 解释器）。
+   在宿主侧以 `chroot + qemu-mipsel` 用户态方式直接验证时报 `Exec format error`，
+   原因是 Docker Desktop VM 未注册 MIPS binfmt_misc——**全系统仿真路径不受影响**
+   （MIPS 代码在 QEMU 的 MIPS 内核上执行）。
+2. httpd 启动的剩余缺口是 **D-Link 配置状态机**：servd 服务管理器循环重跑
+   `dbload.sh`（1340 次），其流程 `devconf get`（flash 读取，QEMU 无该 MTD 布局）
+   失败后回退出厂默认并等待配置就绪，`service HTTP start` 的最终 exec 未到达。
+   解决方向：① 模拟 `/dev/mtd*`/devconf flash 读取（返回厂默认配置）；
+   ② 预置 xmldbc 配置存储的出厂值；③ 按固件家族扩展 boot 成功判据与
+   服务健康探测。此为 per-firmware 手工攻坚，FirmAE 社区对 D-Link 系固件
+   亦为逐型号适配。
+3. **"解包→仿真→静态→动态→发现可利用漏洞"全流程的能力现状**：
+   解包/静态/假设合成/模型调查各段已闭环（4 个真实固件产出 40+ 候选发现）；
+   仿真段已闭环至 guest 用户态稳态运行；最后一环（目标服务在仿真内拉起 +
+   漏洞请求的运行时验证）的阻塞点已精确到 D-Link 配置模拟。备选路径：
+   换用仿真友好的验证固件（FirmAE 官方验证集，如 DIR-505/DIR-601/TEW-634GRU，
+   其 httpd 在 FirmAE 中可启动且存在公开已知的命令注入漏洞），以现有管线
+   复现"发现→候选→运行时验证"的完整闭环。
