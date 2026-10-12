@@ -161,8 +161,25 @@ class DockerQemuBackend(EmulationBackend):
         except Exception:  # noqa: BLE001  报告缺失时回退默认 virt
             arch = ""
         machine = "malta" if arch.startswith("mips") else "virt"
-        self.network = network or UserModeNetworkBackend(machine=machine)
+        # guest 的 LAN IP：优先固件出厂默认（httpd 绑定该地址），QEMU user
+        # 网络 hostfwd 需要显式指向它（默认 10.0.2.15 只适用于 DHCP 场景）
+        self.network = network or UserModeNetworkBackend(machine=machine, guest_ip=self.guest_lan_ip())
         self.logs_path = self.workspace.logs_dir / "console.log"
+
+    def guest_lan_ip(self) -> str:
+        """从固件 defnodes 出厂配置里解析 LAN IP（httpd 绑定它）。"""
+        try:
+            import re as _re
+            report = self.workspace.load_report()
+            rootfs = Path(report.get("extraction", {}).get("rootfs") or "")
+            dv = rootfs / "etc" / "defnodes" / "defaultvalue.xml"
+            if dv.is_file():
+                m = _re.search(r"<ipaddr>(192\.168\.[0-9.]+)</ipaddr>", dv.read_text(encoding="utf-8", errors="ignore"))
+                if m:
+                    return m.group(1)
+        except Exception:  # noqa: BLE001
+            pass
+        return "10.0.2.15"
 
     def prepare(self, firmware_path: str | Path) -> dict[str, Any]:
         report = self.workspace.load_report()
@@ -377,10 +394,43 @@ class DockerQemuBackend(EmulationBackend):
             "ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up\n"
             "route add default gw 10.0.2.2\n"
             # 厂商事件系统会把虚拟环境里 DOWN 的交换口服务停掉
-            # （LAN-5.DOWN -> INFSVCS.LAN-5 stop），显式拉起 Web 服务
-            # 保证运行时观测可用。
-            "sleep 5\n"
-            "service HTTP start\n",
+            # （LAN-5.DOWN -> INFSVCS.LAN-5 stop），servd 状态机不可靠——
+            # 手写静态 httpd.conf（alpha 格式，AnyHost 绑定所有接口）并启动，
+            # 绕过 xmldbc 配置链的阻塞。
+            "sleep 2\n"
+            "cat > /var/run/httpd.conf <<'HTTPCONF'\n"
+            "Umask 026\n"
+            "PIDFile /var/run/httpd.pid\n"
+            "Server\n"
+            "{\n"
+            "\tServerName \"TEW751DR\"\n"
+            "\tServerId \"LAN-1\"\n"
+            "\tInterface eth0\n"
+            "\tPort 80\n"
+            "\tVirtual\n"
+            "\t{\n"
+            "\t\tAnyHost\n"
+            "\t\tPriority 1\n"
+            "\t\tControl\n"
+            "\t\t{\n"
+            "\t\t\tAlias /\n"
+            "\t\t\tLocation /htdocs/web\n"
+            "\t\t\tIndexNames { index.php }\n"
+            "\t\t}\n"
+            "\t\tControl\n"
+            "\t\t{\n"
+            "\t\t\tAlias /goform\n"
+            "\t\t\tLocation /htdocs/mydlink\n"
+            "\t\t\tPathInfo On\n"
+            "\t\t\tExternal\n"
+            "\t\t\t{\n"
+            "\t\t\t\t/usr/sbin/phpcgi { cgi }\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t}\n"
+            "}\n"
+            "HTTPCONF\n"
+            "/sbin/httpd -f /var/run/httpd.conf\n",
             encoding="utf-8",
         )
         try:

@@ -61,7 +61,8 @@ class Round31Tests(unittest.TestCase):
         self.assertEqual(prepared["backend"], "qemu-user-network")
         self.assertEqual(target.host_port, 18080)
         self.assertEqual(target.transport, "qemu-user-network")
-        self.assertIn("hostfwd=tcp:127.0.0.1:18080-:80", " ".join(network.qemu_args()))
+        # guest_ip 现在显式指向固件出厂 LAN IP（默认回退 QEMU user 网络地址）
+        self.assertIn("hostfwd=tcp:127.0.0.1:18080-10.0.2.15:80", " ".join(network.qemu_args()))
 
     def test_capability_detection_and_backend_fallback(self) -> None:
         compatible = DynamicCapabilities(

@@ -92,6 +92,15 @@ class UserspaceImageBuilder(FirmwareImageBuilder):
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists():
             output.unlink()
+        # 关键：mke2fs -d 直接读 Windows bind mount 会丢失大量文件
+        # （特殊 inode stat 失败被跳过，/bin 下的 ELF 几乎全丢）。
+        # 先把 rootfs 复制到容器本地 overlayfs 再构建，构建才可靠。
+        stage = "/tmp/rootfs_build"
+        self.runner.run(["sh", "-c", f"rm -rf {stage} && mkdir -p {stage}"], timeout=60)
+        self.runner.run(
+            ["sh", "-c", f"cp -a {rootfs}/. {stage}/ 2>/dev/null || true"],
+            timeout=600,
+        )
         command = [
             "mke2fs",
             "-t",
@@ -100,7 +109,7 @@ class UserspaceImageBuilder(FirmwareImageBuilder):
             "ext2",
             "-F",
             "-d",
-            str(root),
+            stage,
             str(output),
             f"{size_mb}M",
         ]

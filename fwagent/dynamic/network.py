@@ -39,9 +39,10 @@ class EmulationNetworkBackend:
 class UserModeNetworkBackend(EmulationNetworkBackend):
     name = "qemu-user-network"
 
-    def __init__(self, forwarded_ports: tuple[int, ...] = (80,), machine: str = "virt"):
+    def __init__(self, forwarded_ports: tuple[int, ...] = (80,), machine: str = "virt", guest_ip: str = "10.0.2.15"):
         super().__init__(machine=machine)
         self.forwarded_ports = tuple(forwarded_ports)
+        self.guest_ip = guest_ip
         self.ports: dict[int, ForwardedPort] = {}
 
     def prepare(self, guest_ports: list[int] | None = None) -> dict[str, Any]:
@@ -74,7 +75,7 @@ class UserModeNetworkBackend(EmulationNetworkBackend):
         args = ["-device", f"{self._nic_device()},netdev=net0"]
         hostfwd = []
         for guest_port, item in self.ports.items():
-            hostfwd.append(f"hostfwd=tcp:{item.host}:{item.host_port}-:{guest_port}")
+            hostfwd.append(f"hostfwd=tcp:{item.host}:{item.host_port}-{self.guest_ip}:{guest_port}")
         args.extend(["-netdev", "user,id=net0," + ",".join(hostfwd)])
         return args
 
